@@ -10,7 +10,7 @@ Follow these steps exactly to download, setup, and run the game on a Windows com
 ### Step 2: Save it Correctly (Crucial Step!)
 1. Open the downloaded file. Click **File** in the top-left corner, then click **Save As**.
 2. **LOOK AT THE BOTTOM OF THE SAVE WINDOW:** Where it says *Save as type*, change it from `Text Document (*.txt)` to **All Files (*.*)**.
-3. In the *File name* box, delete everything inside it and type exactly: `rpg game.py` 
+3. In the *File name* box, delete everything inside it and type exactly: `rpggame.py` 
    *(Make sure it ends in `.py` and NOT `.txt`, otherwise Windows won't know it's a game!)*
 4. Choose your **Desktop** or **Documents** folder as the save location, and click **Save**.
 
