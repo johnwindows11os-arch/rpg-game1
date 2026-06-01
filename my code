@@ -1,0 +1,1162 @@
+"""
+Loot Loop RPG v4
+================
+- Click-to-slash combat (Silksong-style) with 3 attack types
+- Dodge roll (Space / RClick)
+- Knockback on hit
+- Fully click-driven shop UI with scaled rerolls and NPC unique items
+- Click-to-advance NPC dialogue
+- Multiple maps, portals, quests
+- NEW: Dynamic Inventory Grid ('I' key) with manual equipment slots
+- NEW: Chest cooldown respawn timer
+"""
+
+import pygame, random, math, json, os
+from dataclasses import dataclass, field
+from typing import Optional
+
+pygame.init()
+
+WIDTH, HEIGHT = 1280, 720
+HUD_TOP = 36          # pixels reserved for the top bar above the map
+SAVE_FILE = "loot_loop_save.json"
+
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Loot Loop RPG")
+clock = pygame.time.Clock()
+
+font     = pygame.font.SysFont(None, 24)
+big_font = pygame.font.SysFont(None, 64)
+med_font = pygame.font.SysFont(None, 36)
+sml_font = pygame.font.SysFont(None, 20)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_button(surface, rect, text, hover=False, color_base=(50,50,80), color_hover=(80,80,140), text_color=(255,255,255)):
+    col = color_hover if hover else color_base
+    pygame.draw.rect(surface, col, rect, border_radius=6)
+    pygame.draw.rect(surface, (180,180,220), rect, 1, border_radius=6)
+    label = font.render(text, True, text_color)
+    surface.blit(label, (rect.centerx - label.get_width()//2, rect.centery - label.get_height()//2))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Item:
+    name: str
+    item_type: str = "weapon"  # "weapon", "armor", "accessory", "potion"
+    value: int = 0
+    rarity: str = "Common"
+    stat_mod: int = 0
+    id: int = field(default_factory=lambda: random.randint(100000, 999999))
+
+@dataclass
+class Quest:
+    title: str
+    goal: int
+    reward_gold: int = 100
+    progress: int = 0
+    completed: bool = False
+
+    def advance(self, amount: int = 1):
+        if not self.completed:
+            self.progress = min(self.progress + amount, self.goal)
+            if self.progress >= self.goal:
+                self.completed = True
+                return True
+        return False
+
+RARITY_COLORS = {
+    "Common":    (200,200,200),
+    "Rare":      (80,120,255),
+    "Epic":      (180,60,255),
+    "Legendary": (255,165,0),
+}
+
+LOOT_TABLE = [
+    Item("Common Sword",    "weapon",    10,  "Common",    1),
+    Item("Rare Axe",        "weapon",    30,  "Rare",      3),
+    Item("Epic Blade",      "weapon",    80,  "Epic",      6),
+    Item("Legendary Hammer","weapon",    200, "Legendary", 12),
+    Item("Leather Vest",     "armor",     15,  "Common",    1),
+    Item("Chain Mail",       "armor",     50,  "Rare",      3),
+    Item("Dragon Scale",     "armor",     150, "Epic",      7),
+    Item("Lucky Ring",       "accessory", 100, "Rare",      2),
+    Item("Health Potion",    "potion",    15,  "Common",    50)
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Player
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Player:
+    def __init__(self):
+        self.level = 1
+        self.hp = 100.0
+        self.max_hp = 100
+        self.xp = 0
+        self.gold = 0
+        self.base_damage = 2
+        self.base_defense = 0
+        self.inventory = []
+        self.max_inventory_slots = 20
+        
+        # Track equipment by slot
+        self.equipment = {
+            "weapon": None,
+            "armor": None,
+            "accessory": None
+        }
+
+        self.rect = pygame.Rect(300, 300+36, 28, 28)
+
+        # Dodge roll state
+        self.rolling = False
+        self.roll_dx = 0.0
+        self.roll_dy = 0.0
+        self.roll_timer = 0
+        self.roll_cooldown = 0
+        self.ROLL_DURATION  = 14
+        self.ROLL_COOLDOWN  = 45
+        self.ROLL_SPEED     = 10
+        self.INVINCIBLE_FRAMES = 12
+
+    def xp_needed(self):        return self.level * 50
+    
+    @property
+    def damage(self):
+        bonus = self.equipment["weapon"].stat_mod if self.equipment["weapon"] else 0
+        return self.base_damage + bonus
+
+    @property
+    def defense(self):
+        bonus_arm = self.equipment["armor"].stat_mod if self.equipment["armor"] else 0
+        bonus_acc = self.equipment["accessory"].stat_mod if self.equipment["accessory"] else 0
+        return self.base_defense + bonus_arm + bonus_acc
+
+    def is_invincible(self):    return self.rolling and self.roll_timer > (self.ROLL_DURATION - self.INVINCIBLE_FRAMES)
+
+    def add_xp(self, amount):
+        self.xp += amount
+        leveled = False
+        while self.xp >= self.xp_needed():
+            self.xp -= self.xp_needed()
+            self.level += 1
+            self.max_hp += 10
+            self.hp = self.max_hp
+            self.base_damage += 1
+            leveled = True
+        return leveled
+
+    def take_damage(self, raw: float):
+        if self.is_invincible(): return
+        mit = self.defense * 0.05
+        self.hp = max(0, self.hp - raw * max(0.1, 1.0 - mit))
+
+    def is_dead(self): return self.hp <= 0
+
+    def start_roll(self, dx, dy):
+        if self.roll_cooldown > 0 or self.rolling: return
+        mag = math.hypot(dx, dy) or 1
+        self.roll_dx = dx / mag
+        self.roll_dy = dy / mag
+        self.rolling = True
+        self.roll_timer = self.ROLL_DURATION
+        self.roll_cooldown = self.ROLL_COOLDOWN
+
+    def update_roll(self):
+        if self.roll_cooldown > 0: self.roll_cooldown -= 1
+        if self.rolling:
+            self.rect.x += int(self.roll_dx * self.ROLL_SPEED)
+            self.rect.y += int(self.roll_dy * self.ROLL_SPEED)
+            self.rect.clamp_ip(pygame.Rect(0,HUD_TOP,WIDTH,HEIGHT-HUD_TOP))
+            self.roll_timer -= 1
+            if self.roll_timer <= 0: self.rolling = False
+
+    def add_to_inventory(self, item) -> bool:
+        if len(self.inventory) < self.max_inventory_slots:
+            self.inventory.append(item)
+            return True
+        return False
+
+    def equip_item(self, item):
+        slot = item.item_type
+        if slot in self.equipment:
+            if self.equipment[slot]:
+                self.inventory.append(self.equipment[slot])
+            self.equipment[slot] = item
+            if item in self.inventory:
+                self.inventory.remove(item)
+
+    def unequip_item(self, slot):
+        if slot in self.equipment and self.equipment[slot]:
+            if len(self.inventory) < self.max_inventory_slots:
+                self.inventory.append(self.equipment[slot])
+                self.equipment[slot] = None
+                return True
+        return False
+
+    def to_dict(self):
+        # Base translation dict for save system
+        eq_save = {k: (v.__dict__ if v else None) for k, v in self.equipment.items()}
+        inv_save = [i.__dict__ for i in self.inventory]
+        return {
+            "level": self.level, "hp": self.hp, "max_hp": self.max_hp,
+            "xp": self.xp, "gold": self.gold, "base_damage": self.base_damage, "base_defense": self.base_defense,
+            "equipment": eq_save, "inventory": inv_save
+        }
+
+    def from_dict(self, d):
+        self.level = d.get("level", 1)
+        self.hp = d.get("hp", 100)
+        self.max_hp = d.get("max_hp", 100)
+        self.xp = d.get("xp", 0)
+        self.gold = d.get("gold", 0)
+        self.base_damage = d.get("base_damage", 2)
+        self.base_defense = d.get("base_defense", 0)
+        
+        # Restore lists
+        self.inventory = []
+        for i_data in d.get("inventory", []):
+            self.inventory.append(Item(**i_data))
+            
+        self.equipment = {"weapon": None, "armor": None, "accessory": None}
+        for k, v_data in d.get("equipment", {}).items():
+            if v_data:
+                self.equipment[k] = Item(**v_data)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attack types
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AttackType:
+    SLASH = "slash"
+    SPIN  = "spin"
+    LUNGE = "lunge"
+
+class Attack:
+    DURATIONS  = {AttackType.SLASH:10, AttackType.SPIN:14, AttackType.LUNGE:10}
+    COOLDOWNS  = {AttackType.SLASH:18, AttackType.SPIN:55, AttackType.LUNGE:30}
+    SLASH_DIST=70; SLASH_W=90; SLASH_H=36
+    SPIN_RADIUS=72
+    LUNGE_LEN=120; LUNGE_W=24
+
+    def __init__(self, kind: str, player_center, mouse_pos, base_damage: int):
+        self.kind = kind
+        self.cx, self.cy = player_center
+        dx = mouse_pos[0]-self.cx; dy = mouse_pos[1]-self.cy
+        self.angle = math.atan2(dy, dx)
+        self.life = self.DURATIONS[kind]
+        self.hit_enemies: set = set()
+        self.damage = base_damage
+        self.knockback = {AttackType.SLASH:8, AttackType.SPIN:5, AttackType.LUNGE:14}[kind]
+        self._build_hitbox()
+
+    def _build_hitbox(self):
+        if self.kind == AttackType.SLASH:
+            hx = self.cx + math.cos(self.angle)*self.SLASH_DIST - self.SLASH_W//2
+            hy = self.cy + math.sin(self.angle)*self.SLASH_DIST - self.SLASH_H//2
+            self.hitbox = pygame.Rect(hx, hy, self.SLASH_W, self.SLASH_H)
+        elif self.kind == AttackType.SPIN:
+            r = self.SPIN_RADIUS
+            self.hitbox = pygame.Rect(self.cx-r, self.cy-r, r*2, r*2)
+        else:
+            hx = self.cx + math.cos(self.angle)*(self.LUNGE_LEN//2) - self.LUNGE_W//2
+            hy = self.cy + math.sin(self.angle)*(self.LUNGE_LEN//2) - self.LUNGE_W//2
+            self.hitbox = pygame.Rect(hx, hy, self.LUNGE_LEN, self.LUNGE_W)
+
+    @property
+    def active(self): return self.life > 0
+    @property
+    def duration(self): return self.DURATIONS[self.kind]
+
+    def update(self): self.life -= 1
+
+    def hits(self, enemy_rect: pygame.Rect, enemy_id: int) -> bool:
+        if enemy_id in self.hit_enemies: return False
+        if self.kind == AttackType.SPIN:
+            dist = math.hypot(enemy_rect.centerx-self.cx, enemy_rect.centery-self.cy)
+            return dist <= self.SPIN_RADIUS
+        return self.hitbox.colliderect(enemy_rect)
+
+    def draw(self, surface: pygame.Surface):
+        if not self.active: return
+        t = self.life / self.duration
+
+        if self.kind == AttackType.SLASH:
+            self._draw_slash(surface, t)
+        elif self.kind == AttackType.SPIN:
+            self._draw_spin(surface, t)
+        else:
+            self._draw_lunge(surface, t)
+
+    def _draw_slash(self, surface, t):
+        spread = math.radians(55)
+        num = 9
+        for i in range(num):
+            a = self.angle - spread + (i/(num-1))*spread*2
+            r_in  = 18 + (1-t)*6
+            r_out = 55 + t*20
+            x1 = self.cx + math.cos(a)*r_in;  y1 = self.cy + math.sin(a)*r_in
+            x2 = self.cx + math.cos(a)*r_out; y2 = self.cy + math.sin(a)*r_out
+            b = int(200*t)
+            col = (b, b, min(255,b+55))
+            w = 3 if i in (0,num-1) else 2
+            pygame.draw.line(surface, col, (int(x1),int(y1)), (int(x2),int(y2)), w)
+        fr = int(14*t)
+        if fr > 0:
+            fx = int(self.cx + math.cos(self.angle)*self.SLASH_DIST)
+            fy = int(self.cy + math.sin(self.angle)*self.SLASH_DIST)
+            fs = pygame.Surface((fr*2,fr*2), pygame.SRCALPHA)
+            fb = int(220*t)
+            pygame.draw.circle(fs,(fb,fb,255,int(180*t)),(fr,fr),fr)
+            surface.blit(fs,(fx-fr,fy-fr))
+
+    def _draw_spin(self, surface, t):
+        r = int(self.SPIN_RADIUS * (0.6 + 0.4*(1-t)))
+        alpha = int(220*t)
+        num = 18
+        for i in range(num):
+            a = (i/num)*math.pi*2 + (1-t)*math.pi
+            x = int(self.cx + math.cos(a)*r)
+            y = int(self.cy + math.sin(a)*r)
+            size = 4 if i%3==0 else 2
+            b = int(200*t)
+            pygame.draw.circle(surface,(b,min(255,b+100),b),(x,y),size)
+        ring_surf = pygame.Surface((r*2+4,r*2+4), pygame.SRCALPHA)
+        pygame.draw.circle(ring_surf,(100,255,120,alpha),(r+2,r+2),r,2)
+        surface.blit(ring_surf,(self.cx-r-2,self.cy-r-2))
+
+    def _draw_lunge(self, surface, t):
+        length = int(self.LUNGE_LEN * (0.5+0.5*t))
+        for offset in (-6,-3,0,3,6):
+            oa = self.angle + math.pi/2
+            ox = math.cos(oa)*offset; oy = math.sin(oa)*offset
+            x1 = int(self.cx + ox + math.cos(self.angle)*10)
+            y1 = int(self.cy + oy + math.sin(self.angle)*10)
+            x2 = int(self.cx + ox + math.cos(self.angle)*length)
+            y2 = int(self.cy + oy + math.sin(self.angle)*length)
+            b = int(220*t)
+            col = (255,b,b//2)
+            pygame.draw.line(surface,col,(x1,y1),(x2,y2),2 if offset!=0 else 3)
+        tip_x = int(self.cx + math.cos(self.angle)*length)
+        tip_y = int(self.cy + math.sin(self.angle)*length)
+        fs = pygame.Surface((20,20),pygame.SRCALPHA)
+        b = int(200*t)
+        pygame.draw.circle(fs,(255,b,0,int(180*t)),(10,10),8)
+        surface.blit(fs,(tip_x-10,tip_y-10))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Enemy
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Enemy:
+    def __init__(self, wave: int, boss=False):
+        size = 60 if boss else 24
+        self.rect = pygame.Rect(random.randint(0,WIDTH-size), random.randint(HUD_TOP,HEIGHT-size), size, size)
+        self.boss = boss
+        self.max_hp = (300+wave*30) if boss else (15+wave*4)
+        self.hp = self.max_hp
+        self.speed = 1.2 if boss else 1.7
+        self.xp_reward   = 25 if boss else 5
+        self.gold_reward = 25 if boss else 5
+        self.damage      = 0.4 if boss else 0.1
+        self.kb_dx = 0.0; self.kb_dy = 0.0; self.kb_timer = 0
+
+    def apply_knockback(self, from_cx, from_cy, magnitude):
+        dx = self.rect.centerx - from_cx; dy = self.rect.centery - from_cy
+        d = max(1, math.hypot(dx,dy))
+        self.kb_dx = dx/d * magnitude; self.kb_dy = dy/d * magnitude
+        self.kb_timer = 8
+
+    def move_toward(self, target: pygame.Rect):
+        if self.kb_timer > 0:
+            self.rect.x += int(self.kb_dx); self.rect.y += int(self.kb_dy)
+            self.kb_dx *= 0.75; self.kb_dy *= 0.75
+            self.kb_timer -= 1
+        else:
+            dx = target.centerx-self.rect.centerx; dy = target.centery-self.rect.centery
+            d = max(1,math.hypot(dx,dy))
+            self.rect.x += int(dx/d*self.speed); self.rect.y += int(dy/d*self.speed)
+        self.rect.clamp_ip(pygame.Rect(0,HUD_TOP,WIDTH,HEIGHT-HUD_TOP))
+
+    def draw(self, surface):
+        col = (255,70,70) if self.boss else (70,255,70)
+        pygame.draw.rect(surface, col, self.rect)
+        bar_w = int(self.rect.w*(self.hp/self.max_hp))
+        pygame.draw.rect(surface,(255,0,0),(self.rect.x,self.rect.y-6,bar_w,4))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Floating damage text
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DamageText:
+    def __init__(self, text, x, y, color=(255,255,255)):
+        self.text=text; self.x=x; self.y=y; self.color=color; self.life=60
+    def update(self): self.y-=1; self.life-=1
+    def draw(self, s): s.blit(font.render(self.text,True,self.color),(self.x,self.y))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NPC  — dialogue & specific store stock
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NPC:
+    def __init__(self, name, rect, dialogue, npc_type="Villager"):
+        self.name=name; self.rect=rect
+        self.dialogue=dialogue; self.idx=0; self.talking=False
+        self.npc_type=npc_type # "Villager", "Merchant", "Blacksmith", "Alchemist"
+        self.shop_stock = []
+        self.reroll_cost = 20
+        self.generate_stock()
+
+    def generate_stock(self):
+        self.shop_stock = []
+        if self.npc_type == "Blacksmith":
+            self.shop_stock = [
+                Item("Common Sword", "weapon", 25, "Common", 1),
+                Item("Rare Axe", "weapon", 60, "Rare", 3),
+                Item("Chain Mail", "armor", 75, "Rare", 3)
+            ]
+        elif self.npc_type == "Merchant":
+            self.shop_stock = [
+                Item("Leather Vest", "armor", 20, "Common", 1),
+                Item("Lucky Ring", "accessory", 120, "Rare", 2)
+            ]
+        elif self.npc_type == "Alchemist":
+            self.shop_stock = [
+                Item("Health Potion", "potion", 15, "Common", 50),
+                Item("Health Potion", "potion", 15, "Common", 50)
+            ]
+
+    def interact(self): self.talking=True
+
+    def click_advance(self, mouse_pos):
+        if not self.talking: return False
+        btn = self._btn_rect()
+        if btn.collidepoint(mouse_pos):
+            self.idx += 1
+            if self.idx >= len(self.dialogue):
+                self.talking=False; self.idx=0
+            return True
+        return False
+
+    def _btn_rect(self):
+        box = pygame.Rect(WIDTH//2-250, HEIGHT-120, 500, 90)
+        return pygame.Rect(box.right-170, box.bottom-38, 160, 28)
+
+    def draw(self, s):
+        pygame.draw.rect(s,(180,120,60),self.rect)
+        s.blit(font.render(self.name,True,(255,255,200)),(self.rect.x,self.rect.y-18))
+
+    def draw_dialogue(self, s, mouse_pos):
+        if not self.talking: return
+        line = self.dialogue[self.idx % len(self.dialogue)]
+        box = pygame.Rect(WIDTH//2-250, HEIGHT-120, 500, 90)
+        pygame.draw.rect(s,(20,20,40),box,border_radius=8)
+        pygame.draw.rect(s,(200,200,255),box,2,border_radius=8)
+        s.blit(med_font.render(self.name,True,(200,200,255)),(box.x+10,box.y+8))
+        s.blit(font.render(line,True,(255,255,255)),(box.x+10,box.y+40))
+        btn = self._btn_rect()
+        hover = btn.collidepoint(mouse_pos)
+        lbl = "Close" if self.idx >= len(self.dialogue)-1 else "Next ›"
+        draw_button(s, btn, lbl, hover)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Portal
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Portal:
+    rect: pygame.Rect
+    destination: str
+    spawn_x: int
+    spawn_y: int
+
+    def draw(self, s):
+        pygame.draw.ellipse(s,(130,80,255),self.rect)
+        s.blit(font.render(f"→ {self.destination}",True,(255,255,255)),(self.rect.x,self.rect.y-18))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Map
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Map:
+    BG    = {"Town":(60,100,60),"Forest":(20,70,20),"Dungeon":(30,20,40)}
+    GRID  = {"Town":(70,120,70),"Forest":(25,85,25),"Dungeon":(40,28,55)}
+
+    def __init__(self, name):
+        self.name=name; self.portals=[]; self.npcs=[]; self.enemies=[]
+        self.bg=self.BG.get(name,(35,90,35)); self.grid=self.GRID.get(name,(45,110,45))
+
+    def draw(self, s):
+        s.fill(self.bg)
+        pygame.draw.rect(s,(10,10,10),(0,0,WIDTH,HUD_TOP))
+        for x in range(0,WIDTH,32): pygame.draw.line(s,self.grid,(x,HUD_TOP),(x,HEIGHT))
+        for y in range(HUD_TOP,HEIGHT,32): pygame.draw.line(s,self.grid,(0,y),(WIDTH,y))
+        for p in self.portals: p.draw(s)
+        for n in self.npcs:    n.draw(s)
+        for e in self.enemies: e.draw(s)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic Shop UI Component
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Shop:
+    W, H = 450, 320
+
+    def __init__(self, rect):
+        self.rect = rect
+        self.open = False
+        self.linked_npc: Optional[NPC] = None
+
+    def draw_world(self, s):
+        pygame.draw.rect(s,(200,150,50),self.rect)
+        s.blit(font.render("SHOP",True,(0,0,0)),(self.rect.x+8,self.rect.y+30))
+        if not self.open:
+            s.blit(sml_font.render("Click Sign",True,(255,240,180)),(self.rect.x-10,self.rect.y+55))
+
+    def world_click(self, mouse_pos, player_rect, current_map):
+        dist = math.hypot(player_rect.centerx-self.rect.centerx, player_rect.centery-self.rect.centery)
+        if dist < 120 and self.rect.collidepoint(mouse_pos):
+            # Bind the shop context to the closest shopping NPC present on the map
+            shop_npcs = [n for n in current_map.npcs if n.npc_type in ["Merchant", "Blacksmith", "Alchemist"]]
+            if shop_npcs:
+                self.linked_npc = shop_npcs[0]
+                self.open = True
+                return True
+        return False
+
+    def _panel_rect(self):
+        return pygame.Rect(WIDTH//2-self.W//2, HEIGHT//2-self.H//2, self.W, self.H)
+
+    def _item_btn(self, panel, i):
+        return pygame.Rect(panel.x+20, panel.y+70+i*46, self.W-40, 38)
+
+    def _reroll_btn(self, panel):
+        return pygame.Rect(panel.x+20, panel.bottom-48, 160, 32)
+
+    def _close_btn(self, panel):
+        return pygame.Rect(panel.right-110, panel.y+10, 90, 28)
+
+    def draw_panel(self, s, player, mouse_pos):
+        if not self.open or not self.linked_npc: return
+        panel = self._panel_rect()
+        pygame.draw.rect(s,(15,15,35),panel,border_radius=10)
+        pygame.draw.rect(s,(200,150,50),panel,2,border_radius=10)
+        
+        s.blit(med_font.render(f"{self.linked_npc.name}'s Shop",True,(200,150,50)),(panel.x+20,panel.y+12))
+        s.blit(font.render(f"Gold: {player.gold}",True,(255,215,0)),(panel.x+20,panel.y+42))
+
+        close = self._close_btn(panel)
+        draw_button(s, close, "✕ Close", close.collidepoint(mouse_pos),(80,20,20),(140,40,40))
+
+        # Render Stock Items
+        for i, item in enumerate(self.linked_npc.shop_stock):
+            btn = self._item_btn(panel, i)
+            can = player.gold >= item.value
+            hover = btn.collidepoint(mouse_pos)
+            base  = (30,50,30) if can else (40,30,30)
+            hov   = (50,90,50) if can else (60,40,40)
+            
+            lbl_color = RARITY_COLORS.get(item.rarity, (255,255,255)) if can else (120,120,120)
+            draw_button(s, btn, f"{item.name} (+{item.stat_mod}) — {item.value}g", hover, base, hov, lbl_color)
+
+        # Render Reroll Button
+        r_btn = self._reroll_btn(panel)
+        r_can = player.gold >= self.linked_npc.reroll_cost
+        r_base = (40,40,70) if r_can else (30,30,40)
+        r_hov  = (60,60,110) if r_can else (30,30,40)
+        draw_button(s, r_btn, f"Reroll ({self.linked_npc.reroll_cost}g)", r_btn.collidepoint(mouse_pos) and r_can, r_base, r_hov, (255,255,255) if r_can else (100,100,100))
+
+    def panel_click(self, mouse_pos, player) -> Optional[str]:
+        if not self.open or not self.linked_npc: return None
+        panel = self._panel_rect()
+        
+        if self._close_btn(panel).collidepoint(mouse_pos):
+            self.open = False
+            return None
+            
+        # Handle Reroll click
+        if self._reroll_btn(panel).collidepoint(mouse_pos):
+            if player.gold >= self.linked_npc.reroll_cost:
+                player.gold -= self.linked_npc.reroll_cost
+                self.linked_npc.generate_stock()
+                self.linked_npc.reroll_cost = int(self.linked_npc.reroll_cost * 1.5) # Scale price
+                return "Shop stock refreshed!"
+            return "Not enough gold to reroll!"
+
+        # Handle purchase selection click
+        for i, item in enumerate(self.linked_npc.shop_stock[:]):
+            if self._item_btn(panel,i).collidepoint(mouse_pos):
+                if player.gold < item.value:
+                    return f"Need {item.value} Gold!"
+                if len(player.inventory) >= player.max_inventory_slots:
+                    return "Inventory is completely full!"
+                
+                player.gold -= item.value
+                player.add_to_inventory(item)
+                self.linked_npc.shop_stock.remove(item)
+                return f"Bought {item.name}!"
+        return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Respawns Chest
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Chest:
+    def __init__(self, rect):
+        self.rect=rect
+        self.open=False
+        self.respawn_timer = 0
+        self.COOLDOWN_TICKS = 1080 # 18 seconds total at 60 FPS
+
+    def update(self):
+        if self.open:
+            self.respawn_timer -= 1
+            if self.respawn_timer <= 0:
+                self.open = False
+
+    def draw(self, s):
+        if self.open:
+            col = (90,80,70)
+            pygame.draw.rect(s,col,self.rect)
+            s.blit(sml_font.render(f"{self.respawn_timer//60}s",True,(140,140,140)),(self.rect.x+10,self.rect.y+15))
+        else:
+            col = (255,215,0)
+            pygame.draw.rect(s,col,self.rect)
+            s.blit(font.render("CHEST",True,(0,0,0)),(self.rect.x-2,self.rect.y+12))
+            s.blit(sml_font.render("Click",True,(255,240,180)),(self.rect.x+2,self.rect.y+30))
+
+    def try_loot(self, mouse_pos, player_rect, player):
+        dist = math.hypot(player_rect.centerx-self.rect.centerx, player_rect.centery-self.rect.centery)
+        if self.open or dist > 100 or not self.rect.collidepoint(mouse_pos):
+            return None
+        
+        if len(player.inventory) >= player.max_inventory_slots:
+            return "FULL"
+
+        self.open = True
+        self.respawn_timer = self.COOLDOWN_TICKS
+        weights=[40,25,12,3,25,12,3,10,15]
+        item = random.choices(LOOT_TABLE,weights=weights,k=1)[0]
+        
+        # Instantiate clean instance copy
+        new_item = Item(item.name, item.item_type, item.value, item.rarity, item.stat_mod)
+        player.add_to_inventory(new_item)
+        return new_item
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Game state machine values
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GS:
+    PLAYING="playing"
+    INVENTORY="inventory"
+    DEAD="dead"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Engine Class
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Game:
+    def __init__(self):
+        self.player = Player()
+        self.state  = GS.PLAYING
+        self.wave   = 1
+        self.hud_visible = True
+        self.attack: Optional[Attack] = None
+        self.cooldowns = {k:0 for k in (AttackType.SLASH, AttackType.SPIN, AttackType.LUNGE)}
+        self.damage_texts: list[DamageText] = []
+        self.notifications: list[tuple[str,int]] = []
+        self.active_npc: Optional[NPC] = None
+        self.last_loot: Optional[Item] = None
+        self.loot_timer = 0
+        
+        # Grid parameters for custom handling menu rendering
+        self.selected_inv_idx: int = -1
+
+        self.maps = {"Town":Map("Town"),"Forest":Map("Forest"),"Dungeon":Map("Dungeon")}
+        self._build_maps()
+        self.current_map = self.maps["Town"]
+        self.shop  = Shop(pygame.Rect(40,40,80,80))
+        self.chest = Chest(pygame.Rect(WIDTH-80,40,50,50))
+        self.quest = Quest("Kill Enemies", goal=10, reward_gold=100)
+        self.current_map.enemies = self._spawn_wave()
+
+    def _build_maps(self):
+        t = self.maps["Town"]
+        t.portals = [
+            Portal(pygame.Rect(WIDTH-60,HEIGHT//2-30,50,60),"Forest",80,HEIGHT//2),
+            Portal(pygame.Rect(WIDTH//2-25,HEIGHT-60,50,50),"Dungeon",WIDTH//2,80),
+        ]
+        t.npcs = [
+            NPC("Elder",    pygame.Rect(200,200,30,30),
+                ["Welcome, hero!","Press 'I' to manage dynamic Equipment slots.","Shops feature specialized stock lists now."], "Villager"),
+            NPC("Blacksmith", pygame.Rect(380,260,30,30),
+                ["I forge deadly weapons and protective armor plates.","Click my shop sign to browse available gears."], "Blacksmith"),
+        ]
+        f = self.maps["Forest"]
+        f.portals = [Portal(pygame.Rect(20,HEIGHT//2-30,50,60),"Town",WIDTH-100,HEIGHT//2)]
+        f.npcs    = [NPC("Alchemist",pygame.Rect(400,300,30,30),
+                         ["Potions maintain functional vitality profiles.","Use the shop sign boundary matrix."], "Alchemist")]
+        d = self.maps["Dungeon"]
+        d.portals = [Portal(pygame.Rect(WIDTH//2-25,20,50,50),"Town",WIDTH//2,HEIGHT-100)]
+        d.npcs = [NPC("Shady Merchant", pygame.Rect(100, 400, 30, 30), ["Rare accessories drop here."], "Merchant")]
+
+    def _spawn_wave(self):
+        if self.wave % 5 == 0:
+            return [Enemy(self.wave, boss=True)]
+        return [Enemy(self.wave) for _ in range(5+self.wave)]
+
+    def save(self):
+        with open(SAVE_FILE,"w") as f:
+            json.dump({"player":self.player.to_dict(),"wave":self.wave,
+                       "quest":{"goal":self.quest.goal,"progress":self.quest.progress,
+                                "reward":self.quest.reward_gold}},f)
+        self.notify("Game Saved!",120)
+
+    def load(self):
+        if not os.path.exists(SAVE_FILE): self.notify("No save.",90); return
+        d=json.load(open(SAVE_FILE))
+        self.player.from_dict(d["player"]); self.wave=d.get("wave",1)
+        q=d.get("quest",{})
+        self.quest.goal=q.get("goal",10); self.quest.progress=q.get("progress",0)
+        self.quest.reward_gold=q.get("reward",100)
+        self.notify("Loaded!",120)
+
+    def notify(self, text, ttl=90): self.notifications.append((text,ttl))
+
+    def try_attack(self, kind, mouse_pos):
+        if self.cooldowns[kind] > 0 or self.player.rolling or self.shop.open: return
+        if self.shop.rect.collidepoint(mouse_pos) or self.chest.rect.collidepoint(mouse_pos): return
+        self.attack = Attack(kind, self.player.rect.center, mouse_pos, self.player.damage)
+        self.cooldowns[kind] = Attack.COOLDOWNS[kind]
+
+    def _process_attack(self):
+        if not self.attack or not self.attack.active: return
+        p = self.player
+        for enemy in self.current_map.enemies[:]:
+            if self.attack.hits(enemy.rect, id(enemy)):
+                self.attack.hit_enemies.add(id(enemy))
+                dmg = self.attack.damage
+                enemy.hp -= dmg
+                enemy.apply_knockback(self.attack.cx, self.attack.cy, self.attack.knockback)
+                self.damage_texts.append(DamageText(str(dmg), enemy.rect.x, enemy.rect.y-10,
+                    {AttackType.SLASH:(255,220,50),
+                     AttackType.SPIN: (100,255,120),
+                     AttackType.LUNGE:(255,120,80)}[self.attack.kind]))
+                if enemy.hp <= 0:
+                    self.current_map.enemies.remove(enemy)
+                    p.gold += enemy.gold_reward
+                    if p.add_xp(enemy.xp_reward): self.notify(f"Level Up! Lv.{p.level}",120)
+                    if self.quest.advance():
+                        p.gold += self.quest.reward_gold
+                        self.notify(f"Quest done! +{self.quest.reward_gold}g",150)
+                        self.quest = Quest("Kill Enemies",
+                                           goal=self.quest.goal+5,
+                                           reward_gold=self.quest.reward_gold+25)
+
+    def _draw_hud(self, mouse_pos):
+        p = self.player
+        pygame.draw.rect(screen,(10,10,10),(0,0,WIDTH,HUD_TOP))
+        pygame.draw.line(screen,(60,60,80),(0,HUD_TOP),(WIDTH,HUD_TOP),1)
+
+        hp_x, hp_w = 8, 160
+        pygame.draw.rect(screen,(80,0,0),(hp_x,6,hp_w,22),border_radius=4)
+        pygame.draw.rect(screen,(210,50,50),(hp_x,6,int(hp_w*(p.hp/p.max_hp)),22),border_radius=4)
+        screen.blit(sml_font.render(f"HP {int(p.hp)}/{p.max_hp}",True,(255,255,255)),(hp_x+4,10))
+
+        stats = f"Lv.{p.level}  XP {p.xp}/{p.xp_needed()}  Gold {p.gold}  Wave {self.wave}  Quest {self.quest.progress}/{self.quest.goal}  Map:{self.current_map.name}"
+        screen.blit(sml_font.render(stats,True,(200,200,200)),(hp_x+hp_w+10,10))
+
+        labels = [("Slash",AttackType.SLASH,(100,180,255)),
+                  ("Spin", AttackType.SPIN, (100,255,130)),
+                  ("Lunge",AttackType.LUNGE,(255,130,80)),
+                  ("Roll", None,            (200,200,200))]
+        bar_w2 = 70
+        for j,(lbl,kind,col) in enumerate(labels):
+            if kind is not None:
+                cdmax = Attack.COOLDOWNS[kind]; cd = self.cooldowns[kind]
+            else:
+                cdmax = Player.ROLL_COOLDOWN; cd = p.roll_cooldown
+            frac = 1 - cd/cdmax
+            bx = WIDTH - (len(labels)-j)*(bar_w2+4) - 8
+            by = 4
+            pygame.draw.rect(screen,(40,40,40),(bx,by,bar_w2,12),border_radius=3)
+            pygame.draw.rect(screen,col,(bx,by,int(bar_w2*frac),12),border_radius=3)
+            screen.blit(sml_font.render(lbl,True,col),(bx,by+13))
+
+        hint = "ESC/I=Menus" if self.hud_visible else "ESC=show info"
+        screen.blit(sml_font.render(hint,True,(100,100,100)),(WIDTH-160,0))
+
+        if not self.hud_visible: return
+
+        lines = [
+            f"BASE DMG {p.base_damage} (+{p.damage - p.base_damage})  DEF {p.defense}",
+            f"Weapon:    " + (p.equipment['weapon'].name if p.equipment['weapon'] else "None"),
+            f"Armor:     " + (p.equipment['armor'].name if p.equipment['armor'] else "None"),
+            f"Accessory: " + (p.equipment['accessory'].name if p.equipment['accessory'] else "None"),
+            f"Inv Space: {len(p.inventory)}/{p.max_inventory_slots}",
+            "",
+            "LClick=Slash  Q=Spin",
+            "RClick=Lunge  Space=Roll",
+            "P=Save  L=Load  I=Inventory",
+        ]
+        panel_h = len(lines)*19 + 10
+        panel_r = pygame.Rect(0, HUD_TOP, 230, panel_h)
+        panel_surf = pygame.Surface((panel_r.w, panel_r.h), pygame.SRCALPHA)
+        panel_surf.fill((10,10,20,180))
+        screen.blit(panel_surf, (panel_r.x, panel_r.y))
+        pygame.draw.rect(screen,(60,60,80),panel_r,1)
+        for i,line in enumerate(lines):
+            screen.blit(sml_font.render(line,True,(200,200,200)),(8, HUD_TOP+6+i*19))
+
+    def _draw_inventory_screen(self, mouse_pos):
+        # Master Menu Dimensions
+        p = self.player
+        pane = pygame.Rect(WIDTH//2-300, HEIGHT//2-200, 600, 400)
+        pygame.draw.rect(screen, (20,20,35), pane, border_radius=8)
+        pygame.draw.rect(screen, (100,100,150), pane, 2, border_radius=8)
+        
+        screen.blit(med_font.render("INVENTORY & EQUIPMENT", True, (255,255,255)), (pane.x+20, pane.y+15))
+        
+        # Draw equipment slots (Left Column Side)
+        slots = ["weapon", "armor", "accessory"]
+        for idx, slot_type in enumerate(slots):
+            slot_rect = pygame.Rect(pane.x+20, pane.y+70+idx*85, 180, 65)
+            pygame.draw.rect(screen, (35,35,55), slot_rect, border_radius=4)
+            pygame.draw.rect(screen, (80,80,110), slot_rect, 1, border_radius=4)
+            
+            # Label
+            screen.blit(sml_font.render(slot_type.upper(), True, (160,160,180)), (slot_rect.x+6, slot_rect.y+6))
+            eq_item = p.equipment[slot_type]
+            if eq_item:
+                lbl_color = RARITY_COLORS.get(eq_item.rarity, (255,255,255))
+                screen.blit(font.render(eq_item.name, True, lbl_color), (slot_rect.x+6, slot_rect.y+24))
+                screen.blit(sml_font.render(f"Mod: +{eq_item.stat_mod}", True, (200,200,200)), (slot_rect.x+6, slot_rect.y+44))
+                
+                # Check Unequip Button Collisions
+                un_btn = pygame.Rect(slot_rect.right-55, slot_rect.y+35, 50, 22)
+                draw_button(screen, un_btn, "Remove", un_btn.collidepoint(mouse_pos), (70,40,40), (120,50,50))
+            else:
+                screen.blit(font.render("Empty", True, (100,100,100)), (slot_rect.x+6, slot_rect.y+26))
+
+        # Draw Grid Slots (Right Column Side)
+        start_x, start_y = pane.x+230, pane.y+70
+        slot_sz, pad = 55, 10
+        cols, rows = 5, 4
+        
+        for i in range(p.max_inventory_slots):
+            c = i % cols
+            r = i // cols
+            bx = start_x + c * (slot_sz + pad)
+            by = start_y + r * (slot_sz + pad)
+            box_rect = pygame.Rect(bx, by, slot_sz, slot_sz)
+            
+            # Select/Hover coloring adjustments
+            bg_col = (45,45,70) if i == self.selected_inv_idx else (25,25,45)
+            pygame.draw.rect(screen, bg_col, box_rect, border_radius=4)
+            pygame.draw.rect(screen, (100,100,130) if i == self.selected_inv_idx else (50,50,70), box_rect, 1, border_radius=4)
+            
+            if i < len(p.inventory):
+                item = p.inventory[i]
+                lbl_color = RARITY_COLORS.get(item.rarity, (255,255,255))
+                # Truncate string text to fit visually inside individual boxes
+                short_name = item.name[:5] + ".." if len(item.name) > 6 else item.name
+                screen.blit(sml_font.render(short_name, True, lbl_color), (bx+4, by+15))
+                screen.blit(sml_font.render(f"+{item.stat_mod}", True, (150,200,150)), (bx+4, by+34))
+
+        # Action Prompt Box for active index selection
+        if self.selected_inv_idx != -1 and self.selected_inv_idx < len(p.inventory):
+            sel_item = p.inventory[self.selected_inv_idx]
+            act_box = pygame.Rect(pane.x+230, pane.bottom-55, 350, 45)
+            pygame.draw.rect(screen, (30,30,50), act_box, border_radius=4)
+            
+            # Action Buttons Configuration
+            action_label = "Use" if sel_item.item_type == "potion" else "Equip"
+            btn_eq = pygame.Rect(act_box.x+10, act_box.y+10, 75, 26)
+            btn_sell = pygame.Rect(act_box.x+95, act_box.y+10, 75, 26)
+            btn_drop = pygame.Rect(act_box.x+180, act_box.y+10, 75, 26)
+            
+            draw_button(screen, btn_eq, action_label, btn_eq.collidepoint(mouse_pos), (40,80,40), (60,120,60))
+            draw_button(screen, btn_sell, f"Sell ({sel_item.value//2}g)", btn_sell.collidepoint(mouse_pos), (80,70,40), (120,100,50))
+            draw_button(screen, btn_drop, "Drop", btn_drop.collidepoint(mouse_pos), (80,40,40), (120,50,50))
+
+    def _handle_inventory_clicks(self, mouse_pos):
+        p = self.player
+        pane = pygame.Rect(WIDTH//2-300, HEIGHT//2-200, 600, 400)
+        
+        # Check explicit Equipment Item slots removal
+        slots = ["weapon", "armor", "accessory"]
+        for idx, slot_type in enumerate(slots):
+            slot_rect = pygame.Rect(pane.x+20, pane.y+70+idx*85, 180, 65)
+            if p.equipment[slot_type]:
+                un_btn = pygame.Rect(slot_rect.right-55, slot_rect.y+35, 50, 22)
+                if un_btn.collidepoint(mouse_pos):
+                    if p.unequip_item(slot_type): self.notify(f"Unequipped {slot_type}!", 90)
+                    else: self.notify("Inventory full!", 90)
+                    return
+
+        # Check Grid Slot Matrix positions
+        start_x, start_y = pane.x+230, pane.y+70
+        slot_sz, pad = 55, 10
+        cols = 5
+        
+        for i in range(p.max_inventory_slots):
+            c = i % cols
+            r = i // cols
+            bx = start_x + c * (slot_sz + pad)
+            by = start_y + r * (slot_sz + pad)
+            if pygame.Rect(bx, by, slot_sz, slot_sz).collidepoint(mouse_pos):
+                if i < len(p.inventory):
+                    self.selected_inv_idx = i
+                else:
+                    self.selected_inv_idx = -1
+                return
+
+        # Check Context Action prompt sub-rect components
+        if self.selected_inv_idx != -1 and self.selected_inv_idx < len(p.inventory):
+            sel_item = p.inventory[self.selected_inv_idx]
+            act_box = pygame.Rect(pane.x+230, pane.bottom-55, 350, 45)
+            
+            btn_eq = pygame.Rect(act_box.x+10, act_box.y+10, 75, 26)
+            btn_sell = pygame.Rect(act_box.x+95, act_box.y+10, 75, 26)
+            btn_drop = pygame.Rect(act_box.x+180, act_box.y+10, 75, 26)
+            
+            if btn_eq.collidepoint(mouse_pos):
+                if sel_item.item_type == "potion":
+                    p.hp = min(p.max_hp, p.hp + sel_item.stat_mod)
+                    self.notify(f"Healed for {sel_item.stat_mod} HP!", 90)
+                    p.inventory.remove(sel_item)
+                else:
+                    p.equip_item(sel_item)
+                    self.notify(f"Equipped {sel_item.name}!", 90)
+                self.selected_inv_idx = -1
+            elif btn_sell.collidepoint(mouse_pos):
+                p.gold += (sel_item.value // 2)
+                self.notify(f"Sold for {sel_item.value//2}g!", 90)
+                p.inventory.remove(sel_item)
+                self.selected_inv_idx = -1
+            elif btn_drop.collidepoint(mouse_pos):
+                self.notify(f"Dropped {sel_item.name}!", 90)
+                p.inventory.remove(sel_item)
+                self.selected_inv_idx = -1
+
+    def _draw_notifications(self):
+        alive=[]; y=HEIGHT//2-60
+        for text,ttl in self.notifications:
+            surf=med_font.render(text,True,(255,255,100))
+            surf.set_alpha(min(255,ttl*4))
+            screen.blit(surf,(WIDTH//2-surf.get_width()//2,y))
+            y+=36; ttl-=1
+            if ttl>0: alive.append((text,ttl))
+        self.notifications=alive
+
+    def _draw_loot(self):
+        if self.last_loot and self.loot_timer>0:
+            item=self.last_loot
+            col=RARITY_COLORS.get(item.rarity,(255,255,255))
+            box=pygame.Rect(WIDTH//2-160,20,320,60)
+            pygame.draw.rect(screen,(10,10,30),box,border_radius=6)
+            pygame.draw.rect(screen,col,box,2,border_radius=6)
+            screen.blit(med_font.render(f"Found: {item.name}",True,col),(box.x+10,box.y+8))
+            screen.blit(font.render(f"[{item.rarity}] Mod: +{item.stat_mod}",True,col),(box.x+10,box.y+38))
+            self.loot_timer-=1
+
+    def _draw_minimap(self):
+        mx,my,mw,mh=WIDTH-130,HEIGHT-130,120,120
+        pygame.draw.rect(screen,(10,10,20),(mx,my,mw,mh))
+        pygame.draw.rect(screen,(80,80,80),(mx,my,mw,mh),1)
+        p=self.player
+        pygame.draw.circle(screen,(100,180,255),(mx+int(p.rect.x/WIDTH*mw), my+int(p.rect.y/HEIGHT*mh)),3)
+        for e in self.current_map.enemies:
+            pygame.draw.circle(screen,(255,80,80),(mx+int(e.rect.x/WIDTH*mw),my+int(e.rect.y/HEIGHT*mh)),2)
+        for pt in self.current_map.portals:
+            pygame.draw.circle(screen,(130,80,255),(mx+int(pt.rect.x/WIDTH*mw),my+int(pt.rect.y/HEIGHT*mh)),3)
+        screen.blit(sml_font.render("MAP",True,(150,150,150)),(mx+2,my-16))
+
+    def _draw_player(self):
+        p=self.player
+        col=(200,230,255) if p.rolling else (60,170,255)
+        pygame.draw.rect(screen,col,p.rect)
+        if p.rolling:
+            ghost=pygame.Surface((p.rect.w,p.rect.h),pygame.SRCALPHA)
+            pygame.draw.rect(ghost,(150,200,255,80),(0,0,p.rect.w,p.rect.h))
+            for i in range(1,4):
+                gx=p.rect.x - int(p.roll_dx*i*6); gy=p.rect.y - int(p.roll_dy*i*6)
+                screen.blit(ghost,(gx,gy))
+
+    # ── Main engine execution loop ───────────────────────────────────────────
+
+    def run(self):
+        running=True
+        while running:
+            clock.tick(60)
+            mouse_pos=pygame.mouse.get_pos()
+            lclick=False; rclick=False; space_dn=False; q_dn=False
+
+            for ev in pygame.event.get():
+                if ev.type==pygame.QUIT: running=False
+                if ev.type==pygame.KEYDOWN:
+                    if ev.key==pygame.K_p: self.save()
+                    if ev.key==pygame.K_l: self.load()
+                    if ev.key==pygame.K_q: q_dn=True
+                    if ev.key==pygame.K_SPACE: space_dn=True
+                    if ev.key==pygame.K_i:
+                        if self.state == GS.PLAYING: self.state = GS.INVENTORY
+                        elif self.state == GS.INVENTORY: self.state = GS.PLAYING
+                    if ev.key==pygame.K_ESCAPE:
+                        if self.shop.open: self.shop.open=False
+                        elif self.state == GS.INVENTORY: self.state = GS.PLAYING
+                        else: self.hud_visible = not self.hud_visible
+                if ev.type==pygame.MOUSEBUTTONDOWN:
+                    if ev.button==1: lclick=True
+                    if ev.button==3: rclick=True
+
+            keys=pygame.key.get_pressed()
+            p=self.player
+
+            if self.state==GS.DEAD:
+                screen.fill((0,0,0))
+                screen.blit(big_font.render("YOU DIED",True,(220,30,30)),(WIDTH//2-160,HEIGHT//2-60))
+                screen.blit(med_font.render("P=Save  L=Load  or close",True,(200,200,200)),(WIDTH//2-200,HEIGHT//2+20))
+                pygame.display.flip(); continue
+
+            # Update Chest ticks natively
+            self.chest.update()
+
+            # ── MENU STATES PROCESSING ───────────────────────────────────────
+            if self.state == GS.INVENTORY:
+                if lclick:
+                    self._handle_inventory_clicks(mouse_pos)
+                
+                # Render loop block
+                self.current_map.draw(screen)
+                self.shop.draw_world(screen)
+                self.chest.draw(screen)
+                self._draw_player()
+                self._draw_inventory_screen(mouse_pos)
+                self._draw_hud(mouse_pos)
+                self._draw_notifications()
+                pygame.display.flip()
+                continue
+
+            # ── STANDARD ACTIVE RUN STATE ────────────────────────────────────
+            if not p.rolling:
+                spd=5; dx=dy=0
+                if keys[pygame.K_w]: dy-=spd
+                if keys[pygame.K_s]: dy+=spd
+                if keys[pygame.K_a]: dx-=spd
+                if keys[pygame.K_d]: dx+=spd
+                p.rect.x+=dx; p.rect.y+=dy
+                p.rect.clamp_ip(pygame.Rect(0,HUD_TOP,WIDTH,HEIGHT-HUD_TOP))
+            p.update_roll()
+
+            if space_dn or keys[pygame.K_LSHIFT]:
+                dx2=dy2=0
+                if keys[pygame.K_w]: dy2-=1
+                if keys[pygame.K_s]: dy2+=1
+                if keys[pygame.K_a]: dx2-=1
+                if keys[pygame.K_d]: dx2+=1
+                if dx2==0 and dy2==0:
+                    mx2=mouse_pos[0]-p.rect.centerx; my2=mouse_pos[1]-p.rect.centery
+                    dx2,dy2=mx2,my2
+                p.start_roll(dx2,dy2)
+
+            npc_consumed=False
+            if lclick and self.active_npc:
+                if self.active_npc.click_advance(mouse_pos):
+                    if not self.active_npc.talking: self.active_npc=None
+                    npc_consumed=True; lclick=False
+
+            shop_consumed=False
+            if lclick and self.shop.open:
+                msg=self.shop.panel_click(mouse_pos, p)
+                if msg: self.notify(msg,90)
+                shop_consumed=True; lclick=False
+            if lclick and not shop_consumed:
+                if self.shop.world_click(mouse_pos, p.rect, self.current_map):
+                    shop_consumed=True; lclick=False
+
+            if lclick and not shop_consumed and not npc_consumed:
+                res=self.chest.try_loot(mouse_pos, p.rect, p)
+                if res == "FULL":
+                    self.notify("Inventory Full!", 90)
+                    lclick = False
+                elif isinstance(res, Item):
+                    self.last_loot=res; self.loot_timer=180
+                    lclick=False
+
+            if not self.active_npc:
+                for npc in self.current_map.npcs:
+                    if p.rect.colliderect(npc.rect.inflate(30,30)):
+                        if lclick and not shop_consumed:
+                            npc.interact(); self.active_npc=npc; lclick=False
+                        break
+
+            if not self.shop.open and not (self.active_npc and self.active_npc.talking):
+                if lclick:   self.try_attack(AttackType.SLASH, mouse_pos)
+                if rclick:   self.try_attack(AttackType.LUNGE, mouse_pos)
+                if q_dn:     self.try_attack(AttackType.SPIN,  mouse_pos)
+
+            for k in self.cooldowns:
+                if self.cooldowns[k]>0: self.cooldowns[k]-=1
+
+            if self.attack:
+                self._process_attack()
+                self.attack.update()
+                if not self.attack.active: self.attack=None
+
+            for enemy in self.current_map.enemies:
+                enemy.move_toward(p.rect)
+                if enemy.rect.colliderect(p.rect): p.take_damage(enemy.damage)
+
+            for portal in self.current_map.portals:
+                if p.rect.colliderect(portal.rect):
+                    self.current_map=self.maps[portal.destination]
+                    p.rect.x=portal.spawn_x; p.rect.y=portal.spawn_y
+                    if not self.current_map.enemies:
+                        self.current_map.enemies=self._spawn_wave()
+                    self.notify(f"Entered {self.current_map.name}!",90)
+                    self.active_npc=None
+                    break
+
+            if not self.current_map.enemies:
+                self.wave+=1
+                self.current_map.enemies=self._spawn_wave()
+                self.notify(f"Wave {self.wave}!",90)
+
+            if p.is_dead(): self.state=GS.DEAD
+
+            for t in self.damage_texts[:]:
+                t.update()
+                if t.life<=0: self.damage_texts.remove(t)
+
+            # ── Draw ──────────────────────────────────────────────────────────
+            self.current_map.draw(screen)
+            self.shop.draw_world(screen)
+            self.chest.draw(screen)
+            self._draw_player()
+
+            if self.attack: self.attack.draw(screen)
+
+            for t in self.damage_texts: t.draw(screen)
+
+            if self.active_npc: self.active_npc.draw_dialogue(screen, mouse_pos)
+            self.shop.draw_panel(screen, p, mouse_pos)
+
+            self._draw_hud(mouse_pos)
+            self._draw_notifications()
+            self._draw_loot()
+            self._draw_minimap()
+
+            pygame.display.flip()
+
+        pygame.quit()
+
+if __name__=="__main__":
+    Game().run()
