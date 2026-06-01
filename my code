@@ -782,7 +782,7 @@ class Game:
             if kind is not None:
                 cdmax = Attack.COOLDOWNS[kind]; cd = self.cooldowns[kind]
             else:
-                cdmax = Player.ROLL_COOLDOWN; cd = p.roll_cooldown
+                cdmax = p.ROLL_COOLDOWN; cd = p.roll_cooldown
             frac = 1 - cd/cdmax
             bx = WIDTH - (len(labels)-j)*(bar_w2+4) - 8
             by = 4
