@@ -1,0 +1,28 @@
+# How to Download and Play on Windows 🎮
+
+Follow these steps exactly to download, setup, and run the game on a Windows computer.
+
+### Step 1: Download the Game File
+1. On the left side of your GitHub screen, click on the file named `rpg game.py` (or whatever your script is named).
+2. Look at the top right of the code window and click the **Download raw file** button (it looks like a little arrow pointing down into a bracket, or says "Raw").
+3. Your web browser will download the file.
+
+### Step 2: Save it Correctly (Crucial Step!)
+1. Open the downloaded file. Click **File** in the top-left corner, then click **Save As**.
+2. **LOOK AT THE BOTTOM OF THE SAVE WINDOW:** Where it says *Save as type*, change it from `Text Document (*.txt)` to **All Files (*.*)**.
+3. In the *File name* box, delete everything inside it and type exactly: `rpg game.py` 
+   *(Make sure it ends in `.py` and NOT `.txt`, otherwise Windows won't know it's a game!)*
+4. Choose your **Desktop** or **Documents** folder as the save location, and click **Save**.
+
+### Step 3: Install Python (If you don't have it)
+Windows needs Python installed to run the game code. If you've never used Python before:
+1. Open the **Microsoft Store** on your computer.
+2. Search for **Python 3.11** or **Python 3.12** and click **Get / Install**.
+*(Alternatively, you can download it from the official website at python.org)*
+
+### Step 4: Install Pygame
+Now we need to install the game graphics engine (Pygame) using the Windows terminal:
+1. Press the **Windows Key** on your keyboard, type **cmd** (Command Prompt) or **PowerShell**, and hit Enter.
+2. Inside the black terminal window that pops up, type the following command and press Enter:
+   ```cmd
+   pip install pygame
