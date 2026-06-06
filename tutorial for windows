@@ -26,3 +26,9 @@ Now we need to install the game graphics engine (Pygame) using the Windows termi
 2. Inside the black terminal window that pops up, type the following command and press Enter:
    ```cmd
    pip install pygame
+
+
+And finally to run the game go in cmd or make a cmd file with the code cd ""where ever the py folder is saved""
+python rpggame.py
+
+just run python rpggame.py or without a py if you get a error
